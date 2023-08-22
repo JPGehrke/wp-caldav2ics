@@ -2,8 +2,7 @@
 /*
 11.11.19: neuer Parser ohne das XML Gedöns :)
 20.11.19: Warnung in Ical File wenn Server Antwort keine Kalenderdaten enthält
-Jan 2023: several modifications in the code made by Jörg-Peter Gehrke, send to W. Joss for review
-13.01.23: 1st review by WJ, NOT finished yet !
+Jan - Aug 2023 several modifications and updates performed
 */
 
 include_once('Caldav2ics_LifeCycle.php');
@@ -57,6 +56,7 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 			'CronInterval' => array(__('Cron Interval', 'wp-caldav2ics'),
 										'daily', 'twicedaily', 'hourly'),
 			'Logging' => array(__('enable Logging', 'wp-caldav2ics'),'true','false'),
+			'caldavwait' => array(__('Server wait time', 'wp-caldav2ics'),'5','10','20','30','40'),  //addition of optins for CALDAV wait server
 		);
 	}
 
@@ -222,7 +222,7 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 		// $icsdir = plugin_dir_path( __FILE__ );	// do not store data in plugin dir
 		$icsdir = ABSPATH."/wp-content/uploads/calendars";	// 09.11.18
 		$maxAttempts = 3; // hardcoded, WJ 14.01.23
-		// replace $loopcnt with $maxAttempts for clarity WJ
+		$caldav_wait = $this->getOption("caldavwait");		
 		if (! file_exists($icsdir))	{
 			wp_mkdir_p($icsdir);
 		}
@@ -316,7 +316,7 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 				
 				// new approach using wp_remote_request() 16.11.18
 				$args = array(
-				'timeout'=> 10 ,		//IMPORTANT !! ensures appropriate time for response from CALDAV server
+				'timeout'=> $caldav_wait,		//IMPORTANT !! ensures appropriate time for response from CALDAV server
 				'headers' => array(
 				'Authorization' => 'Basic '. base64_encode( $CalendarUser . ':' . $CalendarPW ),
 				'Content-Type' => 'application/xml; charset=utf-8',
@@ -365,11 +365,13 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 				$lines[] = array();
 				$l = 0;
 				$foundVCAL = false;
+				$skip = true;
+				$wroteTZ = false;
 				//	$handle = fopen($ICalFile, 'w') or die('Cannot open file:  '.$ICalFile);  // moved, avoid empty $ICalFile in case server does not respond 26.04.23
 								
 				foreach ($text as $line)   {
-					$line = trim($line);
-					//	var_dump($line);
+					$invalidLine = false;
+					$line = trim($line,"\n\r\t\v\x00");
 					if (strlen($line) > 0)	{
 						$l++;
 						if ($LogEnabled)	fwrite($loghandle, $line."\r\n");	// sieht an sich gut aus, ABER alles weitere wird nicht erkannt !!! - ist ja auch nur 1 Zeile :)
@@ -380,34 +382,10 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 								fwrite($handle, 'BEGIN:VCALENDAR'."\r\n");	
 								fwrite($handle, 'VERSION:2.0'."\r\n");		
 								fwrite($handle, 'PRODID:-//hoernerfranzracing/caldav2ics.php'."\r\n");	
-								// End JPG modification 
-							}
-							if ($this->startswith($line,'END:VCALENDAR'))	{
-								$foundVCAL = true;    // only write VTIMEZONE entry once
+								$foundVCAL = true;
 							}
 						}
-					}
-				}
-				// new Action if Server does not write valid VCALENDAR entry 09.03.23	WJ
-				if ( !$foundVCAL ) {
-					if ($LogEnabled)	{
-						fwrite($loghandle, "no valid VCALENDAR Data found in Server response, aborting !\r\n");
-						fwrite($loghandle, "Server Response:\r\n");	// improve Logging 27.02.23
-						fwrite($loghandle, $body_r);	
-						fclose($loghandle);
-					}
-					//	fclose($handle);	// $handle will now be invalid in this case 26.04.23
-					return;
-				}
-				// search and write VTIMEZONE Block 09.03.23
-				$skip = true;
-				$wroteTZ = false;
-				foreach ($text as $line)   {
-					$line = trim($line);
-					//	var_dump($line);
-					if (strlen($line) > 0)	{
-						$l++;
-						if ($LogEnabled)	fwrite($loghandle, $line."\r\n");	// sieht an sich gut aus, ABER alles weitere wird nicht erkannt !!! - ist ja auch nur 1 Zeile :)
+						// search and write VTIMEZONE Block 09.03.23
 						if ( !$wroteTZ )	{
 							if ($this->startswith($line,'BEGIN:VTIMEZONE'))	{	// must be $this->startswith ! 11.11.19
 								$skip = false;
@@ -416,68 +394,74 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 								fwrite($handle, $line."\r\n"); // write everything between 'BEGIN:VTIMEZONE' and 'END:VTIMEZONE'
 							}
 							if ($this->startswith($line,'END:VTIMEZONE'))	{
-								$skip = true;
+								$invalidLine = true;
 								$wroteTZ = true;    // only write VTIMEZONE entry once
 							}
-						}
-					}
-				}
-				if ($LogEnabled)	fwrite($loghandle, "Lines processed: ".$l."\r\n");
-				// parse $response, do NOT write VCALENDAR header for each one, just the event data
-				$skip = true;
-				$found_ical_data = false;
-				foreach ($text as $line) {
-					// $line = trim($line,"\n");	//mod. by J-P. Gehrke, original code was $line = trim($line) - turns out to be prolematic, see below..
-					/** This is important modification. The ics files from my CALDAV server contains info in long lines that are wrapped. By just "trimming" also leading spaces of the wrapped lines will 
-					* be eliminated. This creates problems using https://icalfilter.com reading the *.ics file. Therefore it is proposed useing the command "trim($line, "\n").
-					*/
-					
-					$line = trim($line,"\n\r\t\v\x00");	// mod. 17.07.23 WJ, see https://wordpress.org/support/topic/converted-openxchange-calendar-subscibe-to-google-didnt-work/
+							if ($this->startswith($line,'BEGIN:VEVENT'))	{
+								$wroteTZ = true;    // only used in case no timezone information found, ensures execution of writing calendar information
+							}
+						}		
 
-					if (strlen($line) > 0)	{
-						$invalidLine = false;
-						if (strstr($line,'BEGIN:VCALENDAR'))	{	// first occurrence might not be at line start
-							$skip = true;
-							$found_ical_data = true;
-						}
-						if ($this->startswith($line,'PRODID:'))	{
-							$skip = true;
-						}
-						if (strstr($line,'VERSION:'))	{
-							$skip = true;	// VERSION can appear in different places
-						}
-						if ($this->startswith($line,'CALSCALE:'))	{
-							$skip = true;
-						}
-						if ($this->startswith($line,'BEGIN:VEVENT'))	{
-							$skip = false;
-							//fwrite($handle, "\r\n");	// improves readability, but triggers warning in validator :)
-						}
-						if (!empty($CalendarExclude)) {	// new 14.01.23, check for undocumented Option $CalendarExclude :-)
-							if ($this->startswith($line, $CalendarExclude))		{ 	
-								$invalidLine = true; // invalid line, do not write this !
+						if($wroteTZ) {
+							if (strstr($line,'BEGIN:VCALENDAR'))	{	// first occurrence might not be at line start
+							$skip = true;				
+							}
+							if ($this->startswith($line,'PRODID:'))	{
+								$skip = true;
+							}
+							if (strstr($line,'VERSION:'))	{
+								$skip = true;	// VERSION can appear in different places
+							}
+							if ($this->startswith($line,'CALSCALE:'))	{
+								$skip = true;
+							}
+							if ($this->startswith($line,'BEGIN:VEVENT'))	{
+								$skip = false;
+								$found_ical_data = true;
+							}
+							if (!empty($CalendarExclude)) {	// new 14.01.23, check for undocumented Option $CalendarExclude :-)
+								if ($this->startswith($line, $CalendarExclude))		{ 	
+									$invalidLine = true; // invalid line, do not write this !
+								}
+							}
+							if ($this->startswith($line,'END:VCALENDAR'))	{
+								$skip = true;
+							}
+							if ( !$skip && !$invalidLine)	{  
+								fwrite($handle, $line."\r\n");
 							}
 						}
-						if ($this->startswith($line,'END:VCALENDAR'))	{
-							$skip = true;
-						}
-						if ( !$skip && !$invalidLine)	{  
-							fwrite($handle, $line."\r\n");
-						}
 					}
 				}
-				fwrite($handle, 'END:VCALENDAR'."\r\n");
-				if ((!$found_ical_data) && ($LogEnabled))	{
-					fwrite($loghandle, "WARNING: no valid Ical Data found in Server Response !\r\n");
-					fwrite($loghandle, "Server Response:\r\n");	// improve Logging 27.02.23
-					fwrite($loghandle, $body_r);	
-				}
-				If (is_resource($handle)) {	
-					// looks ok WJ
+
+				if (is_resource($handle)) {	
+					fwrite($handle, 'END:VCALENDAR'."\r\n");
 					fclose($handle);	// muss hierher ! (nicht erst hinter die folgende Klammer... 23.03.19)
-				}
-			}
+					}
+					
+				if ($LogEnabled) {
+				
+			      	fwrite($loghandle,"Lines processed :".$l."\r\n");
+			        
+					if ( !$foundVCAL ) {
+
+						fwrite($loghandle, "numAttempts: ".$numAttempts."\r\n");
+						fwrite($loghandle, "No valid VCALENDAR Data found in Server response !\r\n");
+						fwrite($loghandle, "No phrase 'BEGIN:VCALENDAR' found. Invalid ICS file calendar format ! \r\n");
+						fwrite($loghandle, "Server Response:\r\n");	// improved Logging 27.02.23
+						fwrite($loghandle, $body_r);	
+					}					
+					
+					if (!$found_ical_data) {
+						fwrite($loghandle, "WARNING: no valid Ical Data found in Server Response !\r\n");
+						fwrite($loghandle, "No phrase 'BEGIN:VEVENT' found. No events scheduled ! \r\n");
+						fwrite($loghandle, "Server Response:\r\n");	// improved Logging 27.02.23
+						fwrite($loghandle, $body_r);				
+					}
+				}	
+			}       
 			++$index;
+	
 		}
 		if ($LogEnabled) { 
 			fclose($loghandle);
@@ -731,15 +715,14 @@ class Caldav2ics_Plugin extends Caldav2ics_LifeCycle {
 		echo "<br>";
 		_e('Note: Settings that end with * are mandatory, all others are optional, which will be replaced by Defaults, if not specified.', 'wp-caldav2ics'); echo("<br>");
 		_e('Defaults are:', 'wp-caldav2ics');
+		echo ("</li><li>");
+		_e('Define CALDAV Server response time : 5 !', 'wp-caldav2ics'); 	// JPG proposed addition to the admin page
 		echo ("<ul><li>");
 		_e('Cron Interval: daily', 'wp-caldav2ics');
 		echo ("</li><li>");
 		_e('enable Logging: false', 'wp-caldav2ics');
 		echo ("</li><li>");
-		/*	WJ 14.01.23
-		_e('Maximum attempts for data withdrawal from CALDAV server: 2', 'wp-caldav2ics'); 	// JPG Code - Reviewer to decide whether data pull looping see line 331 shall be maintained !
-		echo ("</li><li>");
-		*/
+
 		_e('ICS File(s): calendar0.ics, calendar1.ics...', 'wp-caldav2ics');
 		echo ("</li></ul>");
 		_e('ICS File(s) must be specified without PATH, will be stored in uploads/calendars. Logfile (if Logging enabeled) will be cron.log in PluginDir.', 'wp-caldav2ics');
